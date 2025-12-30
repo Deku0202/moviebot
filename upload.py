@@ -8,7 +8,7 @@ from telegram.ext import (
 )
 import psycopg2
 
-BOT_TOKEN = "8302762056:AAGsq4eapCa0MZzM7NhGfKdWd5ZRKsEqetU"
+BOT_TOKEN = ""
 ADMIN_ID = 7428371039 
 
 # DB connection

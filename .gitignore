@@ -1,1 +1,4 @@
 .venv
+movies_csv
+credentials.json
+token.pickle

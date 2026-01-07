@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 from telethon.tl.types import DocumentAttributeVideo
 from dotenv import load_dotenv
+from telethon.tl import functions
 
 
 import requests
@@ -23,6 +24,149 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 load_dotenv()  # loads .env into os.environ
+
+import asyncio
+import hashlib
+import os
+import random
+from typing import Optional
+
+from telethon import TelegramClient, custom, helpers, hints, utils
+from telethon.crypto import AES
+from telethon.errors import FloodWaitError, RPCError
+from telethon.tl import functions, types, TLRequest
+
+
+class TelegramUploadClient(TelegramClient):
+    def __init__(self, *args, concurrent: int = 4, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.concurrent = int(concurrent)
+
+    async def upload_file(
+        self: "TelegramUploadClient",
+        file: "hints.FileLike",
+        *,
+        part_size_kb: float | None = None,
+        file_size: int | None = None,
+        file_name: str | None = None,
+        use_cache: type | None = None,
+        key: bytes | None = None,
+        iv: bytes | None = None,
+        progress_callback: "hints.ProgressCallback | None" = None,
+    ) -> "types.TypeInputFile":
+        if isinstance(file, (types.InputFile, types.InputFileBig)):
+            return file  # already uploaded
+
+        uploaded_bytes = 0
+        uploaded_lock = asyncio.Lock()
+
+        async def report_progress(delta: int):
+            nonlocal uploaded_bytes
+            if not progress_callback:
+                return
+            async with uploaded_lock:
+                uploaded_bytes += delta
+                await helpers._maybe_await(progress_callback(uploaded_bytes, file_size or 0))
+
+        async def send_part(request: TLRequest, delta_len: int):
+            # Retry loop for transient errors/floodwait
+            for attempt in range(1, 8):
+                try:
+                    ok = await self(request)
+                    if not ok:
+                        raise RuntimeError("Telegram returned False for upload part")
+                    await report_progress(delta_len)
+                    return
+                except FloodWaitError as e:
+                    wait_s = int(getattr(e, "seconds", 5))
+                    await asyncio.sleep(wait_s + random.uniform(0.5, 2.0))
+                except RPCError:
+                    # exponential-ish backoff
+                    backoff = min(30, 2 ** attempt) + random.uniform(0.2, 1.5)
+                    await asyncio.sleep(backoff)
+            raise RuntimeError("Failed uploading part after retries")
+
+        async with helpers._FileStream(file) as stream:
+            # Use provided file_size if stream doesn't know it (streaming reader)
+            stream_size = getattr(stream, "file_size", None)
+            if stream_size is None:
+                if file_size is None:
+                    raise ValueError("file_size is required for non-seekable streams (like Drive streaming).")
+            else:
+                file_size = stream_size
+
+            assert file_size is not None
+
+            if not part_size_kb:
+                part_size_kb = utils.get_appropriated_part_size(file_size)
+
+            if part_size_kb > 512:
+                raise ValueError("The part size must be <= 512KB")
+            part_size = int(part_size_kb * 1024)
+            if part_size % 1024 != 0:
+                raise ValueError("part_size must be divisible by 1024")
+
+            file_id = helpers.generate_random_long()
+            if not file_name:
+                file_name = stream.name or str(file_id)
+
+            if file_name and not os.path.splitext(file_name)[-1]:
+                file_name += utils._get_extension(stream)
+
+            is_big = file_size > 10 * 1024 * 1024
+            hash_md5 = hashlib.md5()
+            part_count = (file_size + part_size - 1) // part_size
+
+            sem = asyncio.Semaphore(self.concurrent)
+            in_flight: list[asyncio.Task] = []
+
+            async def schedule_part(req: TLRequest, delta_len: int):
+                async with sem:
+                    await send_part(req, delta_len)
+
+            for part_index in range(part_count):
+                part = await helpers._maybe_await(stream.read(part_size))
+                if not isinstance(part, (bytes, bytearray)):
+                    raise TypeError(f"read() returned {type(part)} not bytes")
+
+                # If the stream ends early, this will catch mismatch.
+                if len(part) != part_size and part_index < part_count - 1:
+                    raise ValueError("read less than part_size before end; file_size/read mismatch")
+
+                if key and iv:
+                    part = AES.encrypt_ige(bytes(part), key, iv)
+                else:
+                    part = bytes(part)
+
+                if not is_big:
+                    hash_md5.update(part)
+
+                if is_big:
+                    req = functions.upload.SaveBigFilePartRequest(file_id, part_index, part_count, part)
+                else:
+                    req = functions.upload.SaveFilePartRequest(file_id, part_index, part)
+
+                # Rolling window: keep at most `concurrent` tasks alive
+                task = asyncio.create_task(schedule_part(req, len(part)))
+                in_flight.append(task)
+
+                if len(in_flight) >= self.concurrent:
+                    done, pending = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
+                    # raise any errors early
+                    for d in done:
+                        d.result()
+                    in_flight = list(pending)
+
+            # wait remaining
+            if in_flight:
+                for t in await asyncio.gather(*in_flight, return_exceptions=False):
+                    pass
+
+        if is_big:
+            return types.InputFileBig(file_id, part_count, file_name)
+        else:
+            return custom.InputSizedFile(file_id, part_count, file_name, md5=hash_md5, size=file_size)
+
 
 
 # ---------------- CONFIG ----------------
@@ -422,12 +566,19 @@ async def main():
 
     stream = DriveStreamingReader(resp, name=filename, drive_chunk_mb=32)
 
-    async with TelegramClient(session_name, api_id, api_hash) as client:
+    async with TelegramUploadClient(session_name, api_id, api_hash, concurrent=4) as client:
+        # optional safety pacing
+        await safe_sleep_between_sends()
+
         progress_cb = make_progress_printer("Uploading")
         entity = await resolve_target_entity(client, target_chat)
+        
 
-        # (Optional safety pacing before the send)
-        # await safe_sleep_between_sends()
+        nearest = await client(functions.help.GetNearestDcRequest())
+        print("Nearest DC:", nearest)
+
+        cfg = await client(functions.help.GetConfigRequest())
+        print("Current session DC:", client.session.dc_id)
 
         await client.send_file(
             entity,
@@ -441,8 +592,6 @@ async def main():
         )
 
 
-        # SAFER SEND (pacing + floodwait)
-        await send_file_safe(client, target_chat, uploaded, caption=filename)
 
     print("✅ Done.")
 

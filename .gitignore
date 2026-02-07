@@ -1,7 +1,12 @@
 .venv
-movies_csv
+.DS_Store
 credentials.json
 token.pickle
 .env
 telethon.session*
 token.json
+daily_send_state.json
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

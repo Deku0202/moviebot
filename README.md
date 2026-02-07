@@ -13,6 +13,10 @@ Public CLI tool to upload files from Google Drive to Telegram.
   - `shared` (specific Shared Drive ID)
 - Interactive wizard flow and non-interactive CLI mode
 - Fast upload path via Telethon + parallel upload helper
+- Upload one file or all files in a Drive folder
+- Built-in upload speed cap (default `15 MB/s`) and adaptive FloodWait cooldown
+- Telegram file-size policy: default `2 GB`, supports `up to 4 GB` in premium mode
+- Structured JSON logging for transfer lifecycle and failures
 
 ## Requirements
 
@@ -63,6 +67,34 @@ python uploader.py \
   --non-interactive
 ```
 
+Upload all matched files from a folder:
+
+```bash
+python uploader.py \
+  --scope all \
+  --folder-id <GOOGLE_FOLDER_ID> \
+  --upload-all \
+  --continue-on-error \
+  --non-interactive
+```
+
+Tune speed/flood behavior from CLI:
+
+```bash
+python uploader.py \
+  --file-id <GOOGLE_FILE_ID> \
+  --max-upload-mbps 15 \
+  --upload-connections 8 \
+  --target -1001234567890 \
+  --non-interactive
+```
+
+Premium size mode (up to 4 GB):
+
+```bash
+python uploader.py --file-id <GOOGLE_FILE_ID> --premium --target -1001234567890 --non-interactive
+```
+
 Specific shared drive scope:
 
 ```bash
@@ -81,7 +113,8 @@ See `.env.example` for full list, including:
 
 - auth/session: `TG_API_ID`, `TG_API_HASH`, `TG_SESSION`, `TG_TARGET`
 - safety: `TG_ALLOWED_TARGETS`, `DAILY_SEND_LIMIT`
-- tuning: `TG_UPLOAD_PART_SIZE_KB`, `TG_UPLOAD_CONNECTIONS`, `DRIVE_STREAM_CHUNK_MB`
+- tuning: `TG_MAX_UPLOAD_MBPS`, `TG_UPLOAD_CONNECTIONS`, `TG_MAX_FILE_GB`, `MIN_SECONDS_BETWEEN_SENDS`
+- logging: `LOG_JSON`, `LOG_LEVEL`
 
 ## Public GitHub Safety
 

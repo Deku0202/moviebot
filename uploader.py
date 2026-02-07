@@ -3,12 +3,14 @@ import argparse
 import asyncio
 import io
 import json
+import logging
 import os
 import time
 import random
 import queue
 import threading
 from collections import deque
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
 from dotenv import load_dotenv
@@ -52,6 +54,17 @@ def _env_float(name: str, default: float) -> float:
         raise ValueError(f"Invalid float for {name}: {raw!r}") from exc
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean for {name}: {raw!r}")
+
+
 def _parse_target(value: str):
     value = value.strip()
     if not value:
@@ -83,10 +96,10 @@ if _default_target is not None:
     ALLOWED_TARGETS.add(_default_target)
 
 # SAFETY pacing (tune)
-MIN_SECONDS_BETWEEN_SENDS = _env_float("MIN_SECONDS_BETWEEN_SENDS", 2.0)
+MIN_SECONDS_BETWEEN_SENDS = _env_float("MIN_SECONDS_BETWEEN_SENDS", 5.0)
 JITTER_SECONDS = (
-    _env_float("SEND_JITTER_MIN_SECONDS", 0.0),
-    _env_float("SEND_JITTER_MAX_SECONDS", 2.0),
+    _env_float("SEND_JITTER_MIN_SECONDS", 1.0),
+    _env_float("SEND_JITTER_MAX_SECONDS", 3.0),
 )
 if JITTER_SECONDS[0] > JITTER_SECONDS[1]:
     JITTER_SECONDS = (JITTER_SECONDS[1], JITTER_SECONDS[0])
@@ -98,12 +111,56 @@ DAILY_STATE_FILE = (os.getenv("DAILY_STATE_FILE") or "daily_send_state.json").st
 
 # Transfer tuning
 TG_UPLOAD_PART_SIZE_KB = _env_int("TG_UPLOAD_PART_SIZE_KB", 512)
-TG_UPLOAD_CONNECTIONS = _env_int("TG_UPLOAD_CONNECTIONS", 12)
+TG_UPLOAD_CONNECTIONS = _env_int("TG_UPLOAD_CONNECTIONS", 8)
 TG_UPLOAD_READ_CHUNK_KB = _env_int("TG_UPLOAD_READ_CHUNK_KB", 512)
 DRIVE_STREAM_CHUNK_MB = _env_int("DRIVE_STREAM_CHUNK_MB", 64)
 DRIVE_STREAM_PREFETCH_CHUNKS = _env_int("DRIVE_STREAM_PREFETCH_CHUNKS", 16)
 DRIVE_REQUEST_TIMEOUT_SEC = _env_int("DRIVE_REQUEST_TIMEOUT_SEC", 300)
+TG_MAX_UPLOAD_MBPS = _env_float("TG_MAX_UPLOAD_MBPS", 15.0)
+TG_PREMIUM_ACCOUNT = _env_bool("TG_PREMIUM_ACCOUNT", False)
+TG_MAX_FILE_GB = _env_float("TG_MAX_FILE_GB", 4.0 if TG_PREMIUM_ACCOUNT else 2.0)
+
+# Logging
+LOG_JSON = _env_bool("LOG_JSON", True)
+LOG_LEVEL = (os.getenv("LOG_LEVEL") or "INFO").strip().upper()
 # ----------------------------------------
+
+
+class JsonLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload: Dict[str, Any] = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "event": getattr(record, "event", "log"),
+        }
+        fields = getattr(record, "fields", None)
+        if isinstance(fields, dict):
+            payload.update(fields)
+        msg = record.getMessage()
+        if msg:
+            payload["message"] = msg
+        return json.dumps(payload, ensure_ascii=True, default=str)
+
+
+def _setup_logger() -> logging.Logger:
+    logger = logging.getLogger("uploader")
+    logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    handler = logging.StreamHandler()
+    if LOG_JSON:
+        handler.setFormatter(JsonLogFormatter())
+    else:
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.handlers = [handler]
+    logger.propagate = False
+    return logger
+
+
+LOGGER = _setup_logger()
+
+
+def log_event(event: str, level: str = "info", **fields) -> None:
+    log_fn = getattr(LOGGER, level, LOGGER.info)
+    log_fn("", extra={"event": event, "fields": fields})
 
 
 # ---------- Simple daily cap ----------
@@ -137,6 +194,7 @@ def check_daily_limit_or_raise():
 
 # ---------- Telegram safety helpers ----------
 _last_send_ts = 0.0
+_adaptive_send_delay = 0.0
 
 def assert_allowed_target(target_chat):
     if ALLOWED_TARGETS and target_chat not in ALLOWED_TARGETS:
@@ -153,17 +211,20 @@ async def resolve_target_entity(client, target_chat):
         return await client.get_input_entity(target_chat)
 
 async def safe_sleep_between_sends():
-    global _last_send_ts
+    global _last_send_ts, _adaptive_send_delay
     now = asyncio.get_event_loop().time()
     elapsed = now - _last_send_ts
-    wait = max(0.0, MIN_SECONDS_BETWEEN_SENDS - elapsed)
+    base_delay = MIN_SECONDS_BETWEEN_SENDS + _adaptive_send_delay
+    wait = max(0.0, base_delay - elapsed)
     wait += random.uniform(*JITTER_SECONDS)
     if wait > 0:
+        log_event("send_delay", wait_seconds=round(wait, 2), adaptive_delay=round(_adaptive_send_delay, 2))
         print(f"[Safety] Waiting {wait:.1f}s before sending...")
         await asyncio.sleep(wait)
     _last_send_ts = asyncio.get_event_loop().time()
 
 async def send_file_safe(client, target_chat, uploaded_file, caption: str = "", as_video: bool = False):
+    global _adaptive_send_delay
     check_daily_limit_or_raise()
     
 
@@ -173,23 +234,42 @@ async def send_file_safe(client, target_chat, uploaded_file, caption: str = "", 
 
     for attempt in range(1, MAX_SEND_RETRIES + 1):
         try:
-            return await client.send_file(
+            result = await client.send_file(
                 entity,
                 uploaded_file,
                 caption=caption,
                 supports_streaming=as_video,
                 force_document=not as_video,
             )
+            _adaptive_send_delay = max(0.0, _adaptive_send_delay - 0.5)
+            return result
 
         except FloodWaitError as e:
             wait_s = int(getattr(e, "seconds", 60))
             extra = random.uniform(1, 5)
+            _adaptive_send_delay = min(60.0, _adaptive_send_delay + min(20.0, wait_s * 0.5))
+            log_event(
+                "flood_wait",
+                level="warning",
+                wait_seconds=wait_s,
+                extra_sleep=round(extra, 2),
+                adaptive_delay=round(_adaptive_send_delay, 2),
+                attempt=attempt,
+            )
             print(f"[FloodWait] Sleeping {wait_s + extra:.1f}s...")
             await asyncio.sleep(wait_s + extra)
 
         except RPCError as e:
             backoff = min(60, 2 ** attempt)
             extra = random.uniform(1, 5)
+            log_event(
+                "rpc_error_retry",
+                level="warning",
+                error_type=e.__class__.__name__,
+                error=str(e),
+                backoff_seconds=round(backoff + extra, 2),
+                attempt=attempt,
+            )
             print(f"[RPCError] {e.__class__.__name__}: {e}. Backing off {backoff + extra:.1f}s...")
             await asyncio.sleep(backoff + extra)
 
@@ -396,6 +476,38 @@ class DrivePrefetchReader(io.RawIOBase):
         finally:
             super().close()
 
+
+class RateLimitedReader(io.RawIOBase):
+    def __init__(self, wrapped: io.RawIOBase, max_mbps: float):
+        if max_mbps <= 0:
+            raise ValueError("max_mbps must be > 0.")
+        self._wrapped = wrapped
+        self.name = getattr(wrapped, "name", "upload")
+        self._rate_bps = max_mbps * 1024 * 1024
+        self._start = time.monotonic()
+        self._bytes_read = 0
+
+    def readable(self):
+        return True
+
+    def read(self, n=-1):
+        data = self._wrapped.read(n)
+        if not data:
+            return data
+
+        self._bytes_read += len(data)
+        elapsed = max(time.monotonic() - self._start, 1e-6)
+        expected_elapsed = self._bytes_read / self._rate_bps
+        if expected_elapsed > elapsed:
+            time.sleep(expected_elapsed - elapsed)
+        return data
+
+    def close(self):
+        try:
+            self._wrapped.close()
+        finally:
+            super().close()
+
 def make_progress_printer(label: str, window_sec: float = 5.0):
     start = time.time()
     samples = deque()  # (t, sent_bytes)
@@ -459,11 +571,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--folder-filter", help="Folder name contains filter.")
     parser.add_argument("--file-filter", help="File name contains filter.")
     parser.add_argument("--video-only", action="store_true", help="Only list common video extensions.")
+    parser.add_argument("--premium", action="store_true", help="Use premium Telegram file-size profile (up to 4 GB by default).")
+    parser.add_argument("--max-file-gb", type=float, help="Maximum allowed file size in GB for this run.")
+    parser.add_argument("--max-upload-mbps", type=float, help="Cap upload throughput in MB/s (default from TG_MAX_UPLOAD_MBPS).")
+    parser.add_argument("--upload-connections", type=int, help="Parallel Telegram upload connections (default from TG_UPLOAD_CONNECTIONS).")
+    parser.add_argument("--upload-all", action="store_true", help="Upload all matched files in the selected folder.")
+    parser.add_argument("--max-files", type=int, default=0, help="Limit files when --upload-all is used (0 = no limit).")
+    parser.add_argument("--continue-on-error", action="store_true", help="Continue next file if one upload fails.")
     parser.add_argument("--first-match", action="store_true", help="Auto-pick newest file from filtered list.")
     parser.add_argument(
         "--non-interactive",
         action="store_true",
-        help="Fail instead of prompting. Requires either --file-id, or --folder-id with --first-match.",
+        help="Fail instead of prompting. Requires --file-id, --first-match, or --upload-all with --folder-id.",
     )
     return parser.parse_args()
 
@@ -517,6 +636,108 @@ def _resolve_scope_and_drive(service, args: argparse.Namespace):
     return scope, shared_drive_id
 
 
+def get_downloadable_file_meta(service, file_id: str, max_file_bytes: Optional[int] = None) -> Dict[str, Any]:
+    meta = service.files().get(
+        fileId=file_id,
+        fields="id,name,size,mimeType",
+        supportsAllDrives=True,
+    ).execute()
+    filename = meta.get("name") or file_id
+    mime_type = meta.get("mimeType") or ""
+    if mime_type.startswith("application/vnd.google-apps."):
+        raise RuntimeError(
+            f"'{filename}' is a native Google file ({mime_type}) and cannot be downloaded with alt=media."
+        )
+    if "size" not in meta:
+        raise RuntimeError(f"Google Drive did not return a downloadable size for '{filename}'.")
+    size_bytes = int(meta["size"])
+    if max_file_bytes is not None and size_bytes > max_file_bytes:
+        max_gb = max_file_bytes / (1024 ** 3)
+        size_gb = size_bytes / (1024 ** 3)
+        raise RuntimeError(
+            f"'{filename}' is {size_gb:.2f} GB which exceeds Telegram limit {max_gb:.2f} GB for this run."
+        )
+    return {
+        "id": meta["id"],
+        "name": filename,
+        "size": size_bytes,
+        "mimeType": mime_type,
+    }
+
+
+async def upload_single_drive_file(
+    client: TelegramClient,
+    drive_creds,
+    target_chat,
+    file_meta: Dict[str, Any],
+    max_upload_mbps: float,
+    upload_connections: int,
+    progress_label: str = "Uploading",
+) -> float:
+    file_id = file_meta["id"]
+    filename = file_meta["name"]
+    file_size = int(file_meta["size"])
+    mime_type = file_meta.get("mimeType") or ""
+
+    log_event("file_selected", file_id=file_id, file_name=filename, size_bytes=file_size, mime_type=mime_type)
+    print(f"\nSelected: {filename} ({file_size/1024/1024:.2f} MB)")
+
+    sess = AuthorizedSession(drive_creds)
+    stream = None
+    try:
+        url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+        resp = sess.get(url, stream=True, timeout=DRIVE_REQUEST_TIMEOUT_SEC)
+        resp.raise_for_status()
+
+        base_stream = DrivePrefetchReader(
+            resp,
+            name=filename,
+            chunk_mb=DRIVE_STREAM_CHUNK_MB,
+            max_queue_chunks=DRIVE_STREAM_PREFETCH_CHUNKS,
+        )
+        stream = base_stream
+        if max_upload_mbps > 0:
+            stream = RateLimitedReader(base_stream, max_mbps=max_upload_mbps)
+
+        progress_cb = make_progress_printer(progress_label)
+        t0 = time.time()
+        uploaded = await fast_upload_file(
+            client,
+            stream,
+            file_size=file_size,
+            file_name=filename,
+            part_size_kb=TG_UPLOAD_PART_SIZE_KB,
+            connection_count=upload_connections,
+            read_chunk_size=TG_UPLOAD_READ_CHUNK_KB * 1024,
+            progress_callback=progress_cb,
+        )
+        t1 = time.time()
+
+        is_video = mime_type.startswith("video/")
+        await send_file_safe(
+            client,
+            target_chat,
+            uploaded,
+            caption=filename,
+            as_video=is_video,
+        )
+
+        avg = (file_size / max(t1 - t0, 1e-6)) / (1024 * 1024)
+        log_event(
+            "file_uploaded",
+            file_id=file_id,
+            file_name=filename,
+            avg_mbps=round(avg, 2),
+            size_bytes=file_size,
+        )
+        print(f"\nUpload benchmark avg: {avg:.2f} MB/s")
+        return avg
+    finally:
+        if stream is not None:
+            stream.close()
+        sess.close()
+
+
 async def main(args: argparse.Namespace):
     api_id_str = _require_text(
         args.api_id or (os.getenv("TG_API_ID") or "").strip(),
@@ -543,16 +764,42 @@ async def main(args: argparse.Namespace):
 
     # Optional safety check when TG_ALLOWED_TARGETS is configured
     assert_allowed_target(target_chat)
+    log_event("run_start", target=str(target_chat), non_interactive=bool(args.non_interactive))
 
-    if args.non_interactive and not args.file_id and not (args.folder_id and args.first_match):
-        raise ValueError("Non-interactive mode requires --file-id, or --folder-id with --first-match.")
+    if args.max_files < 0:
+        raise ValueError("--max-files must be >= 0.")
+    if args.upload_all and args.first_match:
+        raise ValueError("Use either --upload-all or --first-match, not both.")
+    if args.file_id and (args.upload_all or args.first_match):
+        raise ValueError("--file-id cannot be combined with --upload-all or --first-match.")
+    if args.non_interactive and not args.file_id and not (args.folder_id and (args.first_match or args.upload_all)):
+        raise ValueError(
+            "Non-interactive mode requires --file-id, or --folder-id with --first-match/--upload-all."
+        )
+
+    max_upload_mbps = TG_MAX_UPLOAD_MBPS if args.max_upload_mbps is None else float(args.max_upload_mbps)
+    if max_upload_mbps < 0:
+        raise ValueError("--max-upload-mbps must be >= 0.")
+    upload_connections = TG_UPLOAD_CONNECTIONS if args.upload_connections is None else int(args.upload_connections)
+    if upload_connections <= 0:
+        raise ValueError("--upload-connections must be > 0.")
+    max_file_gb = TG_MAX_FILE_GB if args.max_file_gb is None else float(args.max_file_gb)
+    if args.premium and args.max_file_gb is None:
+        max_file_gb = max(max_file_gb, 4.0)
+    if max_file_gb <= 0:
+        raise ValueError("--max-file-gb must be > 0.")
+    max_file_bytes = int(max_file_gb * (1024 ** 3))
 
     drive_service, drive_creds = build_drive_service_and_creds(GOOGLE_CREDS_FILE)
+
+    selected_file_ids: List[str] = []
 
     file_id = (args.file_id or "").strip() or None
     scope = "all"
     shared_drive_id = None
-    if not file_id:
+    if file_id:
+        selected_file_ids = [file_id]
+    else:
         scope, shared_drive_id = _resolve_scope_and_drive(drive_service, args)
 
         folder_id = (args.folder_id or "").strip() or None
@@ -592,46 +839,64 @@ async def main(args: argparse.Namespace):
             shared_drive_id=shared_drive_id,
             name_contains=file_filter,
             extensions=exts,
-            limit=200,
+            limit=(max(args.max_files, 200) if args.max_files > 0 else (5000 if args.upload_all else 200)),
         )
         if not files:
             raise RuntimeError("No files found in that folder (with your filters).")
 
-        if args.first_match:
-            file_id = files[0]["id"]
-            print(f"[Select] Using newest match: {files[0]['name']} (id={file_id})")
+        upload_all = args.upload_all
+        if not args.non_interactive and not args.upload_all and not args.first_match:
+            upload_all = input("\nUpload all files in this folder? (y/N): ").strip().lower() == "y"
+
+        if upload_all:
+            if len(files) == 200 and args.max_files == 0:
+                print("[Drive] Reloading full file list for upload-all mode...")
+                files = list_files_in_folder(
+                    drive_service,
+                    folder_id=folder_id,
+                    scope=scope,
+                    shared_drive_id=shared_drive_id,
+                    name_contains=file_filter,
+                    extensions=exts,
+                    limit=5000,
+                )
+            selected = files
+            if args.max_files > 0:
+                selected = selected[:args.max_files]
+            selected_file_ids = [f["id"] for f in selected]
+            print(f"[Select] Uploading {len(selected_file_ids)} file(s) from folder.")
+        elif args.first_match:
+            selected_file_ids = [files[0]["id"]]
+            print(f"[Select] Using newest match: {files[0]['name']} (id={files[0]['id']})")
         else:
             print("\nFiles (newest first, up to 200):")
             for i, f in enumerate(files, 1):
                 size_mb = (int(f.get("size", 0)) / (1024 * 1024)) if f.get("size") else 0
                 print(f"{i:>3}. {f['name']}  |  {size_mb:.2f} MB  |  id={f['id']}")
             if args.non_interactive:
-                raise ValueError("Non-interactive mode needs --first-match (or --file-id) to avoid prompts.")
-            file_id = pick_by_number_or_id("\nPick file by number or paste file ID: ", files)
+                raise ValueError("Non-interactive mode needs --first-match/--upload-all (or --file-id).")
+            chosen_id = pick_by_number_or_id("\nPick file by number or paste file ID: ", files)
+            selected_file_ids = [chosen_id]
 
-    meta = drive_service.files().get(fileId=file_id, fields="name,size,mimeType", supportsAllDrives=True).execute()
-    filename = meta["name"]
-    mime_type = meta.get("mimeType") or ""
-    if mime_type.startswith("application/vnd.google-apps."):
-        raise RuntimeError(
-            f"'{filename}' is a native Google file ({mime_type}) and cannot be downloaded with alt=media."
-        )
-    if "size" not in meta:
-        raise RuntimeError(f"Google Drive did not return a downloadable size for '{filename}'.")
-    file_size = int(meta["size"])
-    print(f"\nSelected: {filename} ({file_size/1024/1024:.2f} MB)")
+    if not selected_file_ids:
+        raise RuntimeError("No files selected for upload.")
 
-    sess = AuthorizedSession(drive_creds)
-    url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
-    resp = sess.get(url, stream=True, timeout=DRIVE_REQUEST_TIMEOUT_SEC)
-    resp.raise_for_status()
+    file_metas = []
+    precheck_failures: List[str] = []
+    for sid in selected_file_ids:
+        try:
+            file_metas.append(get_downloadable_file_meta(drive_service, sid, max_file_bytes=max_file_bytes))
+        except Exception as exc:
+            err = f"{sid}: {exc}"
+            if args.continue_on_error or len(selected_file_ids) > 1:
+                precheck_failures.append(err)
+                log_event("file_precheck_skip", level="warning", file_id=sid, error=str(exc))
+                print(f"[Skip] {err}")
+                continue
+            raise
 
-    stream = DrivePrefetchReader(
-        resp,
-        name=filename,
-        chunk_mb=DRIVE_STREAM_CHUNK_MB,
-        max_queue_chunks=DRIVE_STREAM_PREFETCH_CHUNKS,
-    )
+    if not file_metas:
+        raise RuntimeError("No downloadable files left after filtering.")
 
     client = TelegramClient(
         session_name,
@@ -647,45 +912,68 @@ async def main(args: argparse.Namespace):
 
     try:
         print("[Telegram] Connecting...")
+        log_event("telegram_connect_start")
         try:
             await asyncio.wait_for(client.connect(), timeout=60)
         except asyncio.TimeoutError as exc:
+            log_event("telegram_connect_timeout", level="error", timeout_seconds=60)
             raise RuntimeError("Telegram connection timed out after 60s. Check internet/VPN/proxy and try again.") from exc
+        log_event("telegram_connect_ok")
 
         if not await client.is_user_authorized():
             print("[Telegram] Session is not authorized yet. Complete the login prompt.")
+            log_event("telegram_authorization_required")
             await client.start()
+            log_event("telegram_authorization_ok")
 
-        progress_cb = make_progress_printer("Uploading")
-        t0 = time.time()
-
-        uploaded = await fast_upload_file(
-            client,
-            stream,
-            file_size=file_size,
-            file_name=filename,
-            part_size_kb=TG_UPLOAD_PART_SIZE_KB,
-            connection_count=TG_UPLOAD_CONNECTIONS,
-            read_chunk_size=TG_UPLOAD_READ_CHUNK_KB * 1024,
-            progress_callback=progress_cb,
+        print(
+            f"[Tune] Upload cap={max_upload_mbps:.1f} MB/s | "
+            f"connections={upload_connections} | "
+            f"send gap={MIN_SECONDS_BETWEEN_SENDS:.1f}s"
+        )
+        log_event(
+            "tuning_applied",
+            max_upload_mbps=round(max_upload_mbps, 2),
+            upload_connections=upload_connections,
+            max_file_gb=round(max_file_gb, 2),
+            premium_mode=bool(args.premium or TG_PREMIUM_ACCOUNT),
         )
 
-        t1 = time.time()
-
-        is_video = mime_type.startswith("video/")
-        await send_file_safe(
-            client,
-            target_chat,
-            uploaded,
-            caption=filename,
-            as_video=is_video,
-        )
-
-        avg = (file_size / (t1 - t0)) / (1024 * 1024)
-        print(f"\nUpload benchmark avg: {avg:.2f} MB/s")
+        success_count = 0
+        failures: List[str] = list(precheck_failures)
+        total_files = len(file_metas)
+        for idx, meta in enumerate(file_metas, 1):
+            prefix = f"Uploading [{idx}/{total_files}]" if total_files > 1 else "Uploading"
+            try:
+                log_event("upload_begin", file_index=idx, total_files=total_files, file_name=meta["name"])
+                await upload_single_drive_file(
+                    client=client,
+                    drive_creds=drive_creds,
+                    target_chat=target_chat,
+                    file_meta=meta,
+                    max_upload_mbps=max_upload_mbps,
+                    upload_connections=upload_connections,
+                    progress_label=prefix,
+                )
+                success_count += 1
+            except Exception as exc:
+                err = f"{meta['name']}: {exc}"
+                failures.append(err)
+                log_event("upload_error", level="error", file_name=meta["name"], error=str(exc))
+                print(f"[Error] {err}")
+                if not args.continue_on_error:
+                    raise
     finally:
         await client.disconnect()
-        stream.close()
+        log_event("telegram_disconnected")
+
+    if len(file_metas) > 1:
+        print(f"\nSummary: uploaded {success_count}/{len(file_metas)} file(s).")
+        log_event("upload_summary", success_count=success_count, total_files=len(file_metas), failed_count=len(failures))
+        if failures:
+            print("Failed:")
+            for item in failures:
+                print(f"- {item}")
 
     print("✅ Done.")
 
@@ -695,7 +983,9 @@ if __name__ == "__main__":
     try:
         asyncio.run(main(cli_args))
     except KeyboardInterrupt:
+        log_event("run_cancelled", level="warning")
         print("\nCancelled by user.")
     except Exception as exc:
+        log_event("run_failed", level="error", error=str(exc))
         print(f"ERROR: {exc}")
         raise SystemExit(1)
